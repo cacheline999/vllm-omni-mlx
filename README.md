@@ -54,14 +54,14 @@ vllm-omni-mlx is flexible and easy to use with:
 | --- | --- | --- |
 | **TTS** — text → speech | Qwen3-TTS (CustomVoice · Base · VoiceDesign, 0.6B/1.7B) | ✅ verified end-to-end, buffered + streaming — [speech guide](docs/speech.md) |
 | **Omni** — any-to-any chat | Qwen3-Omni 30B-A3B | 🚧 chat works via mlx-vlm; speech-out chat in progress |
-| **ASR** — speech → text | Whisper, Qwen3-ASR, Voxtral, … | 🚧 planned — `/v1/audio/transcriptions` (#68) |
+| **ASR** — speech → text | Qwen3-ASR (decoder-style, served); Whisper, Voxtral, … planned | ✅ verified end-to-end, buffered + streaming — [speech guide](docs/speech.md#transcription-asr) |
 | **Diffusion** — text/image → image | — | 🚧 planned — roadmap (#2) |
 
 | Modality | Examples | Status |
 | --- | --- | --- |
 | **TTS** — text → speech | Qwen3-TTS (CustomVoice · Base · VoiceDesign, 0.6B/1.7B); VoxCPM2 (zero-shot · cloned · described voice, 30+ languages, 48 kHz) | ✅ verified end-to-end, buffered + streaming — [speech guide](docs/speech.md) |
 | **Omni** — any-to-any chat | Qwen3-Omni 30B-A3B | 🚧 chat works via mlx-vlm; speech-out chat in progress |
-| **ASR** — speech → text | Whisper, Qwen3-ASR, Voxtral, … | 🚧 planned — `/v1/audio/transcriptions` (#68) |
+| **ASR** — speech → text | Qwen3-ASR (decoder-style, served); Whisper, Voxtral, … planned | ✅ verified end-to-end, buffered + streaming — [speech guide](docs/speech.md#transcription-asr) |
 | **Diffusion** — text/image → image | — | 🚧 planned — roadmap (#2) |
 
 Text-only LLMs and image-in/text-out VLMs load through their engines but are
@@ -135,7 +135,7 @@ re-prefill, so correctness never depends on the cache).
 | `POST /v1/messages` | Anthropic (SSE streaming, image blocks) |
 | `POST /v1/audio/speech` | OpenAI audio (`wav` / chunked `pcm` with `stream: true`) |
 | `GET /v1/audio/voices` | preset speakers of the loaded TTS model |
-| `POST /v1/audio/transcriptions` | OpenAI audio (multipart `file`; `json` / `text` / `verbose_json`) — `--asr-model`, `[asr]` extra |
+| `POST /v1/audio/transcriptions` | OpenAI audio (multipart `file`; `json` / `text` / `verbose_json`, or SSE deltas with `stream=true`) — `--asr-model`, `[asr]` extra |
 | `GET /v1/models`, `GET /health` | model list, liveness |
 
 Bring up a speech server and talk to it:

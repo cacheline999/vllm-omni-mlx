@@ -8,7 +8,7 @@ digits spelled out in the text so normalization stays trivial). Catches
 catastrophic breakage on either side — a broken decode loop, a resample
 mismatch, a mangled prompt — not fine WER differences between checkpoints.
 
-Both models stay resident in one process (≈3 GB on the 4-bit defaults); run it
+Both models stay resident in one process (≈5.4 GiB peak on the 4-bit defaults); run it
 on its own, not next to another heavy battery on a 16 GB machine.
 
     python scripts/asr_roundtrip.py --voices vivian ryan --max-wer 0.15

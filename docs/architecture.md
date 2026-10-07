@@ -31,8 +31,9 @@ flowchart TD
     TS --> LOCK
     LOCK --> MLX --> GPU
 
-    ASR["planned · issue #68: /v1/audio/transcriptions<br/>decoder-style ASR, born-compiled"]
-    ASR -.-> GATE
+    ASR["asr/service.py · /v1/audio/transcriptions<br/>decoder-style Qwen3-ASR, buffered + SSE (#68)"]
+    GATE --> ASR
+    ASR --> LOCK
 ```
 
 ## Layers
@@ -42,6 +43,7 @@ flowchart TD
 | API layer | `server.py` | OpenAI and Anthropic dialects over the same core; speech endpoints (`/v1/audio/speech`, `/v1/audio/voices`); request auth; SSE and chunked-PCM streaming (sync generation bridged from a worker thread into the event loop) |
 | Normalization | `schemas.py` | One internal `UnifiedRequest` for both chat APIs; text/image/audio parts; eager media decoding with a 25 MiB remote-fetch cap |
 | Backends | `backends.py` | `TextBackend` (mlx-lm) and `OmniBackend` (mlx-vlm); auto-selection by model config; stop-sequence filtering; generation serialized under a lock |
+| ASR serving | `asr/service.py`, `asr/capabilities.py` | Decoder-style speech recognition (`/v1/audio/transcriptions`): the capability matrix rejects unserved families at boot, request validation and decode run before the lock, buffered or SSE-streamed text; the OpenAI `prompt` field is the decoder's static prompt head |
 | TTS serving | `tts/service.py` | Request validation (voice strings vs cloning objects vs design instructions → 400s with guidance), output formats (wav / raw pcm), the generation lock |
 | TTS pipeline | `tts/` | `config`/`variants` (checkpoint typing + path×type dispatch), `generate` (buffered) and `stream_loop` (streaming fast path), `prompt_embeds` + `prefix_cache` (per-voice prompt pieces + static-prefix KV reuse), `compiled_steps` (mx.compile'd talker/predictor/sampler closures), `code2wav`/`talker`/`code_predictor` seams |
 | Runtime | MLX | Model execution on the Metal GPU over unified memory |

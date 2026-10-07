@@ -12,7 +12,9 @@ Operational and development scripts.
   ```
 
   Turn 1 measures the cold prefix; later turns extend the same conversation and
-  measure the server's cached-prefix path. With a key: `--api-key` or
+  measure the server's cached-prefix path. `--asr --asr-file clip.wav` probes
+  `/v1/audio/transcriptions` the same way (TTFT incl. audio prefill, ITL, TPOT,
+  RTF; `--asr-prompt` / `--asr-hotwords` size the static prompt head). With a key: `--api-key` or
   `VLLM_OMNI_MLX_KEY`.
 
 - `spike_mlxaudio_qwen3tts.py` (#9): one-shot harness for the M1.0 spike —
