@@ -185,6 +185,19 @@ class ServiceTest(unittest.TestCase):
         events.close()  # what Starlette does on client disconnect
         self.assertFalse(self.service._lock.locked())
 
+    def test_closing_the_sse_generator_releases_the_service_lock(self):
+        # what Starlette does on client disconnect: it closes the outer SSE
+        # generator, and the inner one (holding the lock) must close with it
+        # deterministically, not whenever the garbage collector gets to it
+        from vllm_omni_mlx.server import _transcription_sse
+
+        inner = self.service.transcribe_stream(b"x")
+        sse = _transcription_sse(inner)
+        self.assertIn(b"transcript.text.delta", next(sse))
+        self.assertTrue(self.service._lock.locked())
+        sse.close()
+        self.assertFalse(self.service._lock.locked())  # `inner` is still referenced here
+
     def test_upload_cap(self):
         with mock.patch("vllm_omni_mlx.asr.service.MAX_UPLOAD_BYTES", 4):
             with self.assertRaises(ValueError) as ctx:
@@ -283,6 +296,38 @@ class TranscriptionRouteTest(unittest.TestCase):
         self.assertEqual("".join(p["delta"] for p in payloads[:2]), "héllo 世界")  # non-ASCII is not \\u-escaped
         self.assertIn("世界", response.content.decode())
         self.assertEqual(payloads[-1]["usage"], {"prompt_tokens": 3, "completion_tokens": 2})
+
+    def test_error_midway_through_a_stream_becomes_an_error_event(self):
+        def failing(audio, language=None, prompt=None, hotwords=None, temperature=None):
+            def events():
+                yield {"type": "transcript.text.delta", "delta": "partial"}
+                raise RuntimeError("boom")
+
+            return events()
+
+        self.asr.transcribe_stream = failing
+        response = self.post({"stream": "true"})
+        self.assertEqual(response.status_code, 200)  # headers were already sent
+        payloads = [json.loads(f[len("data: "):]) for f in response.content.decode().split("\n\n") if f]
+        self.assertEqual(payloads[0], {"type": "transcript.text.delta", "delta": "partial"})
+        self.assertIn("boom", payloads[-1]["error"]["message"])
+        self.assertEqual(payloads[-1]["error"]["type"], "server_error")
+
+    def test_form_is_closed_on_success_and_on_early_rejection(self):
+        from starlette.datastructures import FormData
+
+        closed = []
+        original = FormData.close
+
+        async def spy(form):
+            closed.append(True)
+            await original(form)
+
+        with mock.patch.object(FormData, "close", spy):
+            self.assertEqual(self.post().status_code, 200)
+            self.assertEqual(self.post({"stream": "true"}).status_code, 200)
+            self.assertEqual(self.post(files=False).status_code, 400)  # rejected before reading the file
+        self.assertEqual(len(closed), 3)
 
     def test_stream_false_stays_buffered(self):
         response = self.post({"stream": "false"})
