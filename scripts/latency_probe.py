@@ -11,6 +11,9 @@ Stdlib only. Run e.g.:
     python scripts/latency_probe.py --url http://127.0.0.1:8000 \
         --system-words 500 --turns 3 --max-tokens 128
 
+`--asr --asr-file clip.wav` probes /v1/audio/transcriptions the same way
+(TTFT incl. audio prefill, ITL, TPOT, RTF).
+
 Prints one table row per turn; a summary line follows. Against a server
 started with --api-key, pass --api-key (or set VLLM_OMNI_MLX_KEY).
 """
@@ -42,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream", action="store_true", help="with --audio: chunked-PCM stream mode — audio_ttfp, inter-chunk gaps, sustained ratio")
     parser.add_argument("--interval", type=float, default=None, help="streaming_interval seconds for --audio --stream (default: server's 0.5)")
     parser.add_argument("--voice", default="vivian", help="preset voice for --audio mode (default: vivian)")
+    parser.add_argument("--asr", action="store_true", help="probe POST /v1/audio/transcriptions (stream=true): TTFT incl. audio prefill, ITL, TPOT, RTF per turn; needs --asr-file")
+    parser.add_argument("--asr-file", default=None, help="audio file uploaded in --asr mode (any format the server decodes)")
+    parser.add_argument("--asr-prompt", default=None, help="context prompt sent with the upload in --asr mode (the OpenAI `prompt` field)")
+    parser.add_argument("--asr-hotwords", default=None, help="comma-separated hotwords sent with the upload in --asr mode")
+    parser.add_argument("--asr-language", default=None, help="language hint in --asr mode (default: auto-detect)")
     parser.add_argument("--audio-text", default="Welcome to the speech latency probe. This paragraph is deliberately long so that the real time factor and chunk cadence are meaningful over a sustained generation.", help="text synthesized in --audio mode")
     return parser
 
@@ -137,6 +145,81 @@ def probe_audio_stream(args, headers: dict) -> int:
     return 0
 
 
+def _multipart(fields: dict, filename: str, data: bytes) -> tuple[bytes, str]:
+    """Stdlib multipart/form-data body: text `fields` plus one `file` part."""
+    boundary = f"probe{int(time.time() * 1000)}"
+    parts = []
+    for name, value in fields.items():
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n".encode() + data + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def probe_asr(args) -> int:
+    """--asr: stream a transcription per turn and report the decoder-style
+    chat doctrine's metrics (#68): TTFT — upload + decode + audio-encoder
+    prefill + first token — then ITL between deltas, TPOT (mean time per
+    output token after the first), and RTF (total / audio seconds).
+
+    Turn 1 pays any one-time compile/warm cost; later turns are the steady
+    state. Re-run with --asr-prompt / --asr-hotwords to see the static prompt
+    head's cost (what the prompt-prefix cache will remove)."""
+    if not args.asr_file:
+        print("--asr needs --asr-file PATH", file=sys.stderr)
+        return 2
+    with open(args.asr_file, "rb") as f:
+        audio = f.read()
+    fields = {"stream": "true"}
+    if args.asr_language:
+        fields["language"] = args.asr_language
+    if args.asr_prompt:
+        fields["prompt"] = args.asr_prompt
+    if args.asr_hotwords:
+        fields["hotwords"] = args.asr_hotwords
+    body, content_type = _multipart(fields, os.path.basename(args.asr_file), audio)
+    headers = {"Content-Type": content_type}
+    if args.api_key:
+        headers["Authorization"] = f"Bearer {args.api_key}"
+
+    print(f"asr stream — {os.path.basename(args.asr_file)} ({len(audio) / 1024:.0f} KiB)")
+    print(f"{'turn':>4} {'TTFT ms':>8} {'ITL p50':>8} {'ITL p95':>8} {'ITL max':>8} {'TPOT ms':>8} {'RTF':>6} {'audio s':>8} {'tokens':>7}")
+    for turn in range(1, args.turns + 1):
+        request = urllib.request.Request(f"{args.url}/v1/audio/transcriptions", data=body, headers=headers)
+        start = time.perf_counter()
+        arrivals: list[float] = []
+        done = None
+        with _OPENER.open(request, timeout=600) as response:
+            for raw in response:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                event = json.loads(line[6:])
+                if event.get("type") == "transcript.text.delta":
+                    arrivals.append(time.perf_counter() - start)
+                elif event.get("type") == "transcript.text.done":
+                    done = event
+                elif "error" in event:
+                    print(f"{turn:>4}  server error: {event['error'].get('message')}", flush=True)
+        total = time.perf_counter() - start
+        if not arrivals or done is None:
+            print(f"{turn:>4}  no transcript returned", flush=True)
+            continue
+        gaps = [b - a for a, b in zip(arrivals, arrivals[1:])]
+        tpot = (arrivals[-1] - arrivals[0]) / (len(arrivals) - 1) if len(arrivals) > 1 else float("nan")
+        nan = float("nan")
+        print(
+            f"{turn:>4} {arrivals[0]*1000:8.0f} {statistics.median(gaps)*1000 if gaps else nan:8.1f}"
+            f" {_p95(gaps)*1000:8.1f} {max(gaps)*1000 if gaps else nan:8.1f} {tpot*1000:8.1f}"
+            f" {total/max(done['duration'],1e-9):6.2f} {done['duration']:8.2f} {done['usage']['completion_tokens']:7d}",
+            flush=True,
+        )
+    return 0
+
+
 def probe_turn(messages: list, args) -> dict:
     headers = {"Content-Type": "application/json"}
     if args.api_key:
@@ -207,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
     system = " ".join(["You are a careful assistant; keep the full context in mind."] * max(1, args.system_words // 9))
     if args.audio:
         return probe_audio(args)
+    if args.asr:
+        return probe_asr(args)
 
     messages = [{"role": "system", "content": system}]
 
