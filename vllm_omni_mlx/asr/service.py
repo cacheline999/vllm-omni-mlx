@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from ..audio_io import decode_audio
 from .config import SAMPLE_RATE, ASRConfig
@@ -28,7 +28,7 @@ RESPONSE_FORMATS = ("json", "text", "verbose_json")
 #: upload cap, same as the OpenAI API's
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
-#: ISO-639-1 → the language names Qwen3-ASR's prompt template uses
+#: ISO-639-1/3 codes → the language names Qwen3-ASR's prompt template uses
 _ISO_TO_NAME = {
     "zh": "Chinese", "en": "English", "yue": "Cantonese", "ar": "Arabic", "de": "German",
     "fr": "French", "es": "Spanish", "pt": "Portuguese", "id": "Indonesian", "it": "Italian",
@@ -37,6 +37,14 @@ _ISO_TO_NAME = {
     "da": "Danish", "fi": "Finnish", "pl": "Polish", "cs": "Czech", "fil": "Filipino",
     "fa": "Persian", "el": "Greek", "ro": "Romanian", "hu": "Hungarian", "mk": "Macedonian",
 }
+
+
+def _flatten_language(detected):
+    """mlx-audio reports the detected language as a list on the buffered
+    path and a string on the streaming one."""
+    if isinstance(detected, (list, tuple)):
+        return detected[0] if detected else None
+    return detected
 
 
 @dataclass
@@ -65,16 +73,10 @@ class ASRService:
     def model_type(self) -> str:
         return self._model_type
 
-    def transcribe(
-        self,
-        audio: bytes,
-        language: Optional[str] = None,
-        prompt: Optional[str] = None,
-        hotwords: Optional[list[str]] = None,
-        temperature: Optional[float] = None,
-    ) -> Transcription:
-        """Transcribe encoded audio bytes. Raises ValueError on invalid
-        requests; generation is serialized under the service lock."""
+    def _prepare(self, audio, language, prompt, hotwords, temperature):
+        """Request validation + decode, shared by the buffered and streaming
+        paths and run *before* the lock: every ValueError here is a request
+        error, and a stream's 400 must land before the first byte."""
         if not audio:
             raise ValueError("file must be non-empty audio")
         if len(audio) > MAX_UPLOAD_BYTES:
@@ -95,11 +97,22 @@ class ASRService:
             kwargs["system_prompt"] = prompt.strip()
         if hotwords:
             kwargs["hotwords"] = hotwords
+        return waveform, duration, kwargs
+
+    def transcribe(
+        self,
+        audio: bytes,
+        language: Optional[str] = None,
+        prompt: Optional[str] = None,
+        hotwords: Optional[list[str]] = None,
+        temperature: Optional[float] = None,
+    ) -> Transcription:
+        """Transcribe encoded audio bytes. Raises ValueError on invalid
+        requests; generation is serialized under the service lock."""
+        waveform, duration, kwargs = self._prepare(audio, language, prompt, hotwords, temperature)
         with self._lock:
             out = self._model.generate(waveform, **kwargs)
-        detected = getattr(out, "language", None)
-        if isinstance(detected, (list, tuple)):  # mlx-audio reports a list for single input
-            detected = detected[0] if detected else None
+        detected = _flatten_language(getattr(out, "language", None))
         return Transcription(
             text=(out.text or "").strip(),
             language=detected,
@@ -109,8 +122,52 @@ class ASRService:
             generation_tokens=int(getattr(out, "generation_tokens", 0) or 0),
         )
 
+    def transcribe_stream(
+        self,
+        audio: bytes,
+        language: Optional[str] = None,
+        prompt: Optional[str] = None,
+        hotwords: Optional[list[str]] = None,
+        temperature: Optional[float] = None,
+    ) -> Iterator[dict]:
+        """Validate and decode eagerly (ValueError before any output), then
+        return a generator of OpenAI-shaped events: one
+        ``transcript.text.delta`` per decoded token and a closing
+        ``transcript.text.done`` carrying the full text, language and usage.
+
+        The service lock is held from the first ``next()`` until the generator
+        finishes or is closed — a client disconnect closes it and releases the
+        lock at the next token (batch-1: nobody else decodes meanwhile). Deltas
+        are decoded token by token by mlx-audio, so a character whose UTF-8
+        bytes span two tokens (rare CJK) arrives as replacement characters;
+        task 5's vendored loop is where incremental detokenization belongs.
+        """
+        waveform, duration, kwargs = self._prepare(audio, language, prompt, hotwords, temperature)
+
+        def events() -> Iterator[dict]:
+            parts: list[str] = []
+            detected = None
+            prompt_tokens = generation_tokens = 0
+            with self._lock:
+                for result in self._model.generate(waveform, stream=True, **kwargs):
+                    detected = _flatten_language(getattr(result, "language", None)) or detected
+                    prompt_tokens = int(getattr(result, "prompt_tokens", 0) or prompt_tokens)
+                    generation_tokens = int(getattr(result, "generation_tokens", 0) or generation_tokens)
+                    if result.text:  # the per-chunk closing result carries no text
+                        parts.append(result.text)
+                        yield {"type": "transcript.text.delta", "delta": result.text}
+            yield {
+                "type": "transcript.text.done",
+                "text": "".join(parts).strip(),
+                "language": detected,
+                "duration": round(duration, 3),
+                "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": generation_tokens},
+            }
+
+        return events()
+
     def _resolve_language(self, language: Optional[str]) -> Optional[str]:
-        """ISO-639-1 code or language name → the name the model's prompt
+        """ISO-639-1/3 code or language name → the name the model's prompt
         template uses; None → auto-detect. Unsupported → ValueError listing
         what the checkpoint supports."""
         if language is None or not language.strip():

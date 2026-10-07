@@ -224,6 +224,24 @@ def _anthropic_sse(req: UnifiedRequest, generator: Iterator[Chunk], model_name: 
 
 
 # --------------------------------------------------------------------------
+# OpenAI: /v1/audio/transcriptions (stream=true)
+# --------------------------------------------------------------------------
+
+def _transcription_sse(events: Iterator[dict]) -> Iterator[bytes]:
+    """OpenAI-shaped transcription events as SSE. A sync generator on purpose:
+    Starlette iterates it in a worker thread and, when the client goes away,
+    closes it — which releases the ASR service lock at the next token."""
+    try:
+        for event in events:
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+    except Exception as exc:
+        body = json.dumps({"error": {"message": f"transcription failed: {exc}", "type": "server_error"}})
+        yield f"data: {body}\n\n".encode()
+    finally:
+        events.close()
+
+
+# --------------------------------------------------------------------------
 # app factory
 # --------------------------------------------------------------------------
 
@@ -379,6 +397,7 @@ def create_app(backend: Backend | None = None, api_key: str | None = None, tts_s
         return JSONResponse({"object": "list", "voices": tts_service.voices})
 
     async def audio_transcriptions(request: Request) -> Response:
+        form = None
         try:
             _check_auth(request, api_key)
             # Starlette spools file parts to disk with no size bound, so refuse
@@ -400,8 +419,12 @@ def create_app(backend: Backend | None = None, api_key: str | None = None, tts_s
                 if name in form and not isinstance(form.get(name), str):
                     raise ApiError(400, f"{name} must be a text field, not a file")
             fmt = form.get("response_format", "json")
-            if form.get("stream") not in (None, "", "false", "False", "0"):
-                raise ApiError(400, "streaming transcription is not supported yet; omit stream")
+            stream_flag = str(form.get("stream", "false")).strip().lower()
+            if stream_flag not in ("", "true", "false", "1", "0"):
+                raise ApiError(400, f"stream must be true or false, got '{form.get('stream')}'")
+            stream = stream_flag in ("true", "1")
+            if stream and fmt == "verbose_json":
+                raise ApiError(400, "verbose_json is not available with stream; the closing transcript.text.done event carries text, language and usage")
             temperature = form.get("temperature")
             try:
                 temperature = float(temperature) if temperature not in (None, "") else None
@@ -416,6 +439,23 @@ def create_app(backend: Backend | None = None, api_key: str | None = None, tts_s
             if upload.size is not None and upload.size > asr_max_upload:
                 raise ApiError(413, f"file is {upload.size / 2**20:.1f} MiB; the cap is {asr_max_upload // 2**20} MiB")
             data = await upload.read(asr_max_upload + 1)
+            if stream:
+                # validation + decode happen here, so a bad request is a plain
+                # 400 before the first SSE byte; the generator then holds the
+                # service lock until it finishes or the client disconnects
+                events = await asyncio.to_thread(
+                    asr_service.transcribe_stream,
+                    data,
+                    form.get("language") or None,
+                    form.get("prompt") or None,
+                    hotword_list,
+                    temperature,
+                )
+                return StreamingResponse(
+                    _transcription_sse(events),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
             result = await asyncio.to_thread(
                 asr_service.transcribe,
                 data,
@@ -434,6 +474,11 @@ def create_app(backend: Backend | None = None, api_key: str | None = None, tts_s
             return _openai_error(ApiError(400, str(exc), err_type="invalid_request_error"))
         except Exception as exc:
             return _openai_error(ApiError(500, f"transcription failed: {exc}", err_type="server_error"))
+        finally:
+            # the upload is already bytes by now (or the request failed); don't
+            # leave the spooled temp file to the garbage collector
+            if form is not None:
+                await form.close()
 
     routes = [
         Route("/health", health),

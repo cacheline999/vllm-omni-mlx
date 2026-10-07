@@ -4,6 +4,7 @@ weight-gated real transcription."""
 
 import importlib.util
 import io
+import json
 import os
 
 # weight-gated loads resolve from the local HF cache (see test_audio_speech.py)
@@ -57,6 +58,8 @@ class FakeModel:
 
     def generate(self, audio, **kwargs):
         self.calls.append((audio, kwargs))
+        if kwargs.get("stream"):
+            return self._stream()
         return SimpleNamespace(
             text="  hello world ",
             language="English",
@@ -64,6 +67,15 @@ class FakeModel:
             prompt_tokens=12,
             generation_tokens=3,
         )
+
+
+    @staticmethod
+    def _stream():
+        # per-token results, then the per-chunk closing result: empty text,
+        # token totals — what mlx-audio's stream_transcribe yields
+        for token in ("hello", " world"):
+            yield SimpleNamespace(text=token, is_final=False, language="English", prompt_tokens=0, generation_tokens=0)
+        yield SimpleNamespace(text="", is_final=True, language="English", prompt_tokens=12, generation_tokens=2)
 
 
 def fake_decode(data, sample_rate, label="audio"):
@@ -143,6 +155,36 @@ class ServiceTest(unittest.TestCase):
             self.assertIn(hint, str(ctx.exception))
         self.assertEqual(self.model.calls, [])  # nothing reached the model
 
+    def test_stream_events_are_openai_shaped(self):
+        events = list(self.service.transcribe_stream(b"x", language="en", prompt="ctx"))
+        self.assertEqual(
+            [e["type"] for e in events],
+            ["transcript.text.delta", "transcript.text.delta", "transcript.text.done"],
+        )
+        self.assertEqual([e["delta"] for e in events[:2]], ["hello", " world"])
+        done = events[-1]
+        self.assertEqual(done["text"], "hello world")
+        self.assertEqual(done["language"], "English")
+        self.assertEqual(done["usage"], {"prompt_tokens": 12, "completion_tokens": 2})
+        _, kwargs = self.model.calls[0]
+        self.assertTrue(kwargs["stream"])
+        self.assertEqual((kwargs["language"], kwargs["system_prompt"]), ("English", "ctx"))
+
+    def test_stream_validates_before_returning_a_generator(self):
+        with self.assertRaises(ValueError):
+            self.service.transcribe_stream(b"")
+        with self.assertRaises(ValueError):
+            self.service.transcribe_stream(b"x", language="klingon")
+        self.assertEqual(self.model.calls, [])
+
+    def test_stream_holds_the_lock_and_close_releases_it(self):
+        events = self.service.transcribe_stream(b"x")
+        self.assertFalse(self.service._lock.locked())  # nothing runs until iterated
+        next(events)
+        self.assertTrue(self.service._lock.locked())
+        events.close()  # what Starlette does on client disconnect
+        self.assertFalse(self.service._lock.locked())
+
     def test_upload_cap(self):
         with mock.patch("vllm_omni_mlx.asr.service.MAX_UPLOAD_BYTES", 4):
             with self.assertRaises(ValueError) as ctx:
@@ -166,6 +208,19 @@ class FakeASRService:
 
     def __init__(self):
         self.calls = []
+
+    def transcribe_stream(self, audio, language=None, prompt=None, hotwords=None, temperature=None):
+        if not audio:
+            raise ValueError("file must be non-empty audio")
+        self.calls.append(dict(audio=audio, language=language, stream=True))
+
+        def events():
+            yield {"type": "transcript.text.delta", "delta": "héllo "}
+            yield {"type": "transcript.text.delta", "delta": "世界"}
+            yield {"type": "transcript.text.done", "text": "héllo 世界", "language": "English", "duration": 1.0,
+                   "usage": {"prompt_tokens": 3, "completion_tokens": 2}}
+
+        return events()
 
     def transcribe(self, audio, language=None, prompt=None, hotwords=None, temperature=None):
         if not audio:
@@ -206,7 +261,8 @@ class TranscriptionRouteTest(unittest.TestCase):
         cases = [
             (dict(files=False), "file is required"),
             (dict(data={"response_format": "srt"}), "response_format"),
-            (dict(data={"stream": "true"}), "streaming"),
+            (dict(data={"stream": "maybe"}), "stream must be"),
+            (dict(data={"stream": "true", "response_format": "verbose_json"}), "verbose_json"),
             (dict(data={"temperature": "hot"}), "temperature"),
         ]
         for kwargs, hint in cases:
@@ -215,6 +271,29 @@ class TranscriptionRouteTest(unittest.TestCase):
             self.assertIn(hint, response.json()["error"]["message"])
         not_multipart = self.client.post("/v1/audio/transcriptions", json={"file": "x"}, headers=self.AUTH)
         self.assertEqual(not_multipart.status_code, 400)
+
+    def test_stream_true_returns_sse_events(self):
+        for value in ("true", "True", "1"):
+            response = self.post({"stream": value})
+            self.assertEqual(response.status_code, 200, value)
+            self.assertTrue(response.headers["content-type"].startswith("text/event-stream"))
+        frames = [f for f in response.content.decode().split("\n\n") if f]
+        payloads = [json.loads(f[len("data: "):]) for f in frames]
+        self.assertEqual([p["type"] for p in payloads], ["transcript.text.delta"] * 2 + ["transcript.text.done"])
+        self.assertEqual("".join(p["delta"] for p in payloads[:2]), "héllo 世界")  # non-ASCII is not \\u-escaped
+        self.assertIn("世界", response.content.decode())
+        self.assertEqual(payloads[-1]["usage"], {"prompt_tokens": 3, "completion_tokens": 2})
+
+    def test_stream_false_stays_buffered(self):
+        response = self.post({"stream": "false"})
+        self.assertEqual(response.json(), {"text": "hello"})
+
+    def test_stream_request_errors_are_400_not_sse(self):
+        response = self.client.post(
+            "/v1/audio/transcriptions", files={"file": ("a.wav", b"", "audio/wav")}, data={"stream": "true"}, headers=self.AUTH
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(response.headers["content-type"].startswith("application/json"))
 
     def test_oversized_upload_is_413_without_reaching_the_service(self):
         with mock.patch("vllm_omni_mlx.server.asr_max_upload", 8):
